@@ -84,6 +84,7 @@ func newClient(skipVerify bool, cfg *config) (*ctx, error) {
 	}
 	tr := &http.Transport{
 		TLSClientConfig: tlsConfig,
+		Dial:            cfg.dial,
 	}
 	jar, err := cookiejar.New(&cookiejar.Options{
 		PublicSuffixList: publicsuffix.List,
