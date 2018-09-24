@@ -14,6 +14,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/decred/dcrd/chaincfg/chainhash"
 	pb "github.com/decred/dcrwallet/rpc/walletrpc"
@@ -358,6 +359,95 @@ func (c *ctx) inventory() error {
 	return nil
 }
 
+func (c *ctx) _voteTrickler(token, voteBit string, ctres *pb.CommittedTicketsResponse, smr *pb.SignMessagesResponse) ([]string, *v1.BallotReply, error) {
+
+	type voteInterval struct {
+		votes int
+		at    time.Duration
+	}
+	votes := uint64(len(ctres.TicketAddresses))
+	duration := c.cfg.voteDuration
+	minDelay := uint64(33)    // Don't send more votes every minDelay
+	minInterval := uint64(60) // Don't vote much more than once a minute
+	bias := 1.9               // Bias for random intervals
+	intervals := uint64(duration.Seconds() / float64(votes) * bias)
+	fmt.Printf("Votes   : %v\n", votes)
+	fmt.Printf("Duration: %v\n", duration)
+	fmt.Printf("Interval: %v\n\n", intervals)
+
+	if intervals < minInterval {
+		m := time.Duration(float64(minInterval)*float64(votes)/bias)*
+			time.Second + time.Second
+		return nil, nil, fmt.Errorf("interval must be > %v, make "+
+			"duration at least %v", minInterval, m)
+	}
+
+	buckets := make([]voteInterval, votes, votes)
+	var done bool
+	for !done {
+		done = true
+		var at time.Duration
+		for i := range buckets {
+			if i == 0 {
+				// We always immediately try to vote
+				continue
+			}
+			seconds, err := util.RandomUint64()
+			if err != nil {
+				return nil, nil, err
+			}
+			if seconds < minDelay {
+				continue
+			}
+			at += time.Duration(seconds%intervals) * time.Second
+			buckets[i] = voteInterval{
+				votes: 1,
+				at:    at,
+			}
+			if at > duration {
+				done = false
+				break
+			}
+		}
+	}
+
+	return nil, nil, fmt.Errorf("moo")
+	// Note that ctres, sm and smr use the same index.
+	cv := v1.Ballot{
+		Votes: make([]v1.CastVote, 0, len(ctres.TicketAddresses)),
+	}
+	tickets := make([]string, 0, len(ctres.TicketAddresses))
+	for k, v := range ctres.TicketAddresses {
+		h, err := chainhash.NewHash(v.Ticket)
+		if err != nil {
+			return nil, nil, err
+		}
+		signature := hex.EncodeToString(smr.Replies[k].Signature)
+		cv.Votes = append(cv.Votes, v1.CastVote{
+			Token:     token,
+			Ticket:    h.String(),
+			VoteBit:   voteBit,
+			Signature: signature,
+		})
+		tickets = append(tickets, h.String())
+	}
+
+	// Vote on the supplied proposal
+	responseBody, err := c.makeRequest("POST", v1.RouteCastVotes, &cv)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var vr v1.BallotReply
+	err = json.Unmarshal(responseBody, &vr)
+	if err != nil {
+		return nil, nil, fmt.Errorf("Could not unmarshal CastVoteReply: %v",
+			err)
+	}
+
+	return tickets, &vr, nil
+}
+
 func (c *ctx) _vote(token, voteId string) ([]string, *v1.BallotReply, error) {
 	// XXX This is expensive but we need the snapshot of the votes. Later
 	// replace this with a locally saved file in order to prevent sending
@@ -453,6 +543,12 @@ func (c *ctx) _vote(token, voteId string) ([]string, *v1.BallotReply, error) {
 		return nil, nil, fmt.Errorf("signature failed index %v: %v",
 			k, v.Error)
 	}
+
+	if c.cfg.voteDuration != 0 {
+		return c._voteTrickler(token, voteBit, ctres, smr)
+	}
+
+	// Vote everything at once.
 
 	// Note that ctres, sm and smr use the same index.
 	cv := v1.Ballot{
